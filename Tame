@@ -1,0 +1,684 @@
+# TAME on Equities — AI-Assisted Market Abuse Detection
+## Golden Source: Specification + Literature Review
+### Surveillance Model Use Cases — POC
+
+> **Classification:** Internal use only (Confidential C3) — as per source slides 30/09/2026
+> **Version:** 1.0 — 12/10/2026 — Golden source draft
+> **Scope:** Trading Ahead of Market Event (TAME) on Equity markets, RB-EQ-TAME evolution
+> **Owners:** IMAD (surveillance) / CPL (data) / Trading desks CDR / AI team
+> **Source truth:** 4 slides photographed 12/10/2026: Title + Context + Current model logic + AI-assisted POC simplified v1
+
+---
+
+## Table of Contents
+
+1. Executive Summary
+2. Business Context and Use-Case Definition
+3. Regulatory Grounding: MAR, STOR, Obligations
+4. Current State: RB-EQ-TAME Formal Specification
+5. Target POC: AI-Assisted TAME — Formal Specification
+6. Data Specification
+7. Design Methodology
+8. Literature Review
+9. Assessment: Is the Proposed Approach Interesting?
+10. Risks, Model Risk, EU AI Act, Governance
+11. Evaluation and Back-Test Protocol
+12. Implementation Plan and Technical Options
+13. Functional and Non-Functional Requirements
+14. Open Questions and Decision Log
+15. Glossary
+16. References
+- Appendix A: Production Parameter Table
+- Appendix B: Example Alert File Mock
+- Appendix C: Prompt Templates (LSEG-style)
+- Appendix D: Pseudocode
+- Appendix E: Data Dictionary Template
+
+---
+
+## 1. Executive Summary
+
+**Problem:** IMAD must detect Trading Ahead of Market Events (TAME) — a form of insider dealing under MAR — on equities. The production rule-based model RB-EQ-TAME works **without any Market Event data**. It proxies events by large price moves (Step 1), then checks internal delta-risk breaks (Step 2) and trading volume breaks (Step 3). Consequence: high false positives (every large unexplained price move alerts), high false negatives (anticipatory trading that does not yet move price is missed), and no explanatory narrative for analysts or STOR filing. The macro filter (70% portfolio impacted) specified in the BRD is not implemented.
+
+**POC idea (first simplified version):** invert the pipeline to **exposure-first, event-confirmed**:
+
+> Weekly (Tuesday=D): (a) scan internal delta-risk D-15 to D-1 for unusual exposure volatility → shortlist; (b) LLM looks up public news D-7 to D-1 on shortlist → confirmed list with price-moving news; (c) LLM generates one Excel alert per confirmed stock with internal data + news summary + holistic analysis.
+
+**Verdict of this review:** Yes, the approach is interesting, pragmatic, and aligned with 2024-2026 state-of-the-art SupTech (LSEG Surveillance Guide on Bedrock, FCA Market Abuse TechSprint, Consob ML work, AMF ICY, BaFin ALMA, SEC MIDAS). It uses LLMs for what they do best — retrieval, price-sensitivity classification, summarization, explanation — not for autonomous guilt determination. It fills the missing event-data gap without requiring a full rebuild.
+
+It is **insufficient as-is** for production: temporal logic ambiguous (anticipation vs reaction), fixed thresholds uncalibrated, LLM grounding / hallucination / leakage uncontrolled, evaluation limited to 3 anecdotal cases, macro adjustment still missing, auditability and confidentiality not specified.
+
+This document freezes the spec, surveys the literature that solves each sub-problem, and prescribes a hardened POC v1.1 that keeps the proposal but adds market-adjusted event studies, robust anomaly detection, grounded RAG with citations, graded scoring, and a proper evaluation + governance envelope.
+
+---
+
+## 2. Business Context and Use-Case Definition
+
+### 2.1 Definitions frozen from slides
+
+* **TAME:** Trading Ahead of Market Event. Signs of potential trading by someone possessing inside information before it becomes public, visible in own-account / client-flow / desk exposure.
+* **Market Event:** `public announcement of an information that was previously inside information` (Context slide).
+* **Inside information:** verbatim MAR Art.7: `information of a precise nature, which has not been made public, relating, directly or indirectly, to one or more issuers or to one or more financial instruments, and which, if it were made public, would be likely to have a significant effect on the prices of those financial instruments or on the price of related derivative financial instruments`.
+* **RB-EQ-TAME:** existing rule-based equity TAME model.
+* **CPL:** data provider (trades, orders, risk data, market prices). No Market Event feed.
+* **CDR:** trading desk (Centre de Résultat). Unit at which delta-risk is monitored.
+* **IMAD:** surveillance function owning the model.
+
+### 2.2 Why TAME on equities is hard
+
+1. **Low signal-to-noise:** thousands of price jumps daily, few are insider-driven. Volume of transactions thousands/minute; manual review impossible.
+2. **Adaptive concealment:** literature (Cornell & Sirri on Campbell-Taggart, Meulbroek 1992) shows insiders trade small, split orders, use peers/rings; herd followers amplify volume.
+3. **Asymmetry:** short-sale constraints make positive-news anticipation (buy before takeover/good earnings) easier to detect than negative-news; literature finds pre-announcement run-up ~50% on insider days (Auguste et al.).
+4. **Contextual anomaly:** abuse is not a point outlier but a sequence (build-up → event → unwind) relative to own history + peers + market.
+5. **Explanation burden:** analyst must produce STOR with reasons, prices/volumes, identities, annexes. A score without narrative is not actionable.
+
+### 2.3 Stakeholders and workflow today
+
+`Market data + internal risk → RB-EQ-TAME batch → alerts → IMAD analyst triage → investigation (news manually collated) → dismiss / escalate / STOR → AMF/ESMA`.
+
+Pain: Step 1 generates many price alerts with no news context; analyst spends hours manually searching news to determine price-sensitivity; Step 2-3 thresholds brittle across regimes.
+
+---
+
+## 3. Regulatory Grounding
+
+### 3.1 MAR core
+
+* **Regulation (EU) 596/2014 (MAR), Directive 2014/57/EU (MAD II).** Applies irrespective of venue (regulated, MTF, OTF, OTC).
+* **Art.7 Inside information:** 4 limbs (a) general, (b) commodity derivatives, (c) emission allowances, (d) client pending orders for executors. Precise = set of circumstances existing or reasonably expected / event occurred or reasonably expected + specific enough to infer price effect. Includes intermediate steps of protracted processes (M&A stages, earnings preparation). `Significant effect` = reasonable investor would use it.
+* **Art.8 Insider dealing:** possessing + using by acquiring/disposing/cancelling/amending (including attempt), for own or third-party account, directly/indirectly. Orders placed *before* possession are not insider dealing, but cancellation/amendment *after* possession is presumed to be.
+* **Art.12 Market manipulation** (for completeness, not TAME): false/misleading signals, price positioning, fictitious devices, benchmark manipulation; includes spoofing/layering/wash.
+* **Art.16 Prevention/detection:** (1) trading venues/market operators must have effective arrangements to prevent/detect; (2) **persons professionally arranging/executing transactions (PPAET) — CACIB as bank/investment firm — must have effective arrangements to detect and report suspicious orders/transactions without delay via STOR.** This is the legal basis for IMAD surveillance.
+* **Delegated Reg. 2016/957:** STOR template. Must contain: reporter ID + capacity (own account vs client), order/transaction description (type, venue, price, volume, timestamps, order placement/cancellation means, who placed/received), reasons for suspicion (order-book interaction description, link cash vs derivative), identities (including DOB, address, employment, accounts, client ID), annexes with prices/volumes, attachments (graphs, comms). Incomplete STOR = breach.
+
+### 3.2 ESMA / supervisory expectations
+
+* ESMA MAR Q&A, Technical Standards on detection, Market Abuse indicators (Annex I).
+* Supervisors run own SupTech: **AMF ICY** (advanced analytics), **BaFin ALMA** (integrated alarm), **Consob MAD procedure** (Minenna), **SEC MIDAS**, **FCA MAP / MAI**, **LSEG Market Supervision**. Banks are expected to keep pace; outdated static rules with high false negatives are challenged in inspections.
+* **STOR timeliness:** without delay once reasonable suspicion formed. Weekly batch is acceptable for post-trade TAME surveillance but cannot be the sole control for real-time manipulation; must articulate complementarity.
+
+### 3.3 What this implies for POC
+
+* Model must output STOR-ready evidence, not just a flag.
+* Must distinguish `price-sensitive` (reasonable investor test) from mere mention.
+* Must log how suspicion was formed (audit trail).
+* Must not create tipping-off or selective disclosure via public LLM.
+
+---
+
+## 4. Current State: RB-EQ-TAME Formal Specification
+
+All numbers in brackets are production values per footnote.
+
+### 4.1 Step 1 — Detection of Market Event by price observation
+
+For each equity stock `s` and Control Date `T` (business day):
+
+```
+HighLow[T] = High[T] - Low[T]
+AvgHighLow_10 = mean(HighLow[T-10 .. T-1])
+
+Cond_A := HighLow[T] >= 4 * AvgHighLow_10
+Cond_B := abs(Close[T]/Close[T-1] - 1) >= 8%
+
+Cond_Macro := NOT ( >70% of equities in Cacib portfolio have same signal on T )
+  # specified in BRD, NOT implemented
+
+EventCandidate(s,T) := (Cond_A OR Cond_B) AND Cond_Macro [*macro ignored in prod]
+```
+
+**Critique:**
+
+* Raw, not market-adjusted. A +8% move on a day CAC40 +7% is not idiosyncratic.
+* High-Low 4x is regime-sensitive (low-vol period over-triggers, high-vol under-triggers).
+* No volume/volatility confirmation at this stage.
+* No event identity (what happened?).
+* Single-day, no lookback for protracted leakage.
+
+### 4.2 Step 2 — Delta-risk break per desk
+
+For each `(s,T)` from Step 1, each desk `d`:
+
+```
+AvgLook = mean(DeltaRisk[d,s, t] for t in [T-10, T-1])  # lookback 10 b.d.
+AvgHist = mean(DeltaRisk[d,s, t] for t in [T-40, T-11]) # historical 30 b.d. (implied)
+  # slide says historical period ([30] b.d.)
+
+Cond_1 := abs((AvgLook - AvgHist)/AvgHist) >= 30%   # breaks if AvgHist ~0; no floor handling specified
+Cond_2 := max(abs(AvgLook), abs(AvgHist)) >= 10000 EUR/1%
+  # unit ambiguous: 10k EUR delta or 1% sensitivity; to be clarified as DV01-like
+
+DeskFlag(d,s,T) := Cond_1 AND Cond_2
+```
+
+Keeps `(d,s)` if any desk flags.
+
+**Critique:** mean of signed delta nets long/short; division by near-zero explodes; no peer comparison; no direction vs subsequent price move (informed buy before positive event should be long); fixed 30% across desks/stocks with different volatilities.
+
+### 4.3 Step 3 — Trading activity break
+
+For each flagged `(d,s)`:
+
+```
+MaxDailyVol = max(Volume[d,s,t] for t in lookback)  # window inherits Step2? to confirm
+AvgHistVol  = mean(Volume ... historical)
+
+Cond_V1 := MaxDailyVol > 4 * AvgHistVol
+Cond_V2 := MaxDailyVol * Price >= 1_000_000 EUR
+
+ActivityFlag := Cond_V1 AND Cond_V2
+```
+
+Final alert if all three steps pass.
+
+### 4.4 End-to-end logic
+
+```
+Alerts = { (s,T,d) | EventCandidate(s,T) AND DeskFlag(d,s,T) AND ActivityFlag(d,s,T) }
+```
+
+Essentially `price jump AND exposure jump AND volume jump`. Logical AND reduces false positives but compounds false negatives; ordering means exposure-first anticipatory trades without contemporaneous price jump never reach Step 2.
+
+### 4.5 Worked intuition
+
+If TotalEnergies jumps +9% on T with High-Low 5x average, Step 1 fires. If Equity Derivatives desk delta on Total went from avg €20k to €35k (+75%, max 35k>10k), Step 2 fires. If desk traded max 500k shares vs 100k avg and notional >€1M, Step 3 fires → alert. Analyst then manually googles Total news.
+
+---
+
+## 5. Target POC: AI-Assisted TAME — Formal Specification
+
+### 5.1 Objectives (frozen + explicated)
+
+* **O1:** Improve **detection of Market Events (Step 1)** by exploiting LLM capacity on publicly available information. (Context slide last bullet).
+* **O2 (POC simplified):** demonstrate feasibility of **exposure-first** flow that produces analyst-ready alerts with narrative, on 2-week internal window + 1-week news window, weekly cadence.
+* **O3:** Enable back-test on 3 real cases to calibrate before industrialization.
+* Non-objective (explicit out-of-scope for POC v1): replace RB-EQ-TAME in production, real-time detection, cross-asset (derivatives), insider-ring graph, auto-STOR filing, macro filter implementation (deferred to v1.1).
+
+### 5.2 Principles
+
+1. **LLM assists, human decides.** LLM proposes price-sensitivity + summary; analyst confirms suspicion; no auto-STOR.
+2. **Grounded, cited, reproducible.** Every news claim must carry source URL, publication timestamp, issuer mapping, retrieval timestamp, prompt/model version.
+3. **Confidential by design.** Internal delta/risk never leaves bank VPC; public LLM only sees stock identifiers + public news.
+4. **Temporal hygiene.** No look-ahead: retrieval cutoff enforced, model knowledge cutoff documented.
+5. **Explainable.** Alert contains both quantitative triggers and qualitative narrative + counterfactual (what would dismiss it).
+
+### 5.3 High-level architecture
+
+```
+[Scheduler: Tue D 06:00 CET]
+  |
+  v
+[1. Universe builder] — listed equities with internal delta activity + market data available
+  |
+  v
+[2. Internal anomaly detector] Input: D-15(Mon) to D-1(Mon) delta-risk panel (desk x stock x day)
+  Output: shortlist S1 with scores + features  (reuse Step2 OR new robust method, §7.2)
+  |
+  v
+[3. News retrieval + Event confirmation] For each s in S1, retrieve news D-7(Mon) to D-1(Mon)
+  Sub-steps: entity linking → trusted feed search → dedup → FinBERT pre-filter → LLM price-sensitivity classifier → confirmed list S2
+  |
+  v
+[4. Alert composer] For each s in S2: join internal triggers + market stats + news summaries + holistic analysis → Excel file (1 per stock)
+  |
+  v
+[5. Human review UI / share] → analyst label: true lead / false positive / need more info → feedback store
+```
+
+Note slide wording: `LLM models look up for news` and `LLM models generates an alert`. In hardened design, split into deterministic retrieval + LLM classification/summarization to control hallucination.
+
+### 5.4 Detailed stage spec
+
+#### Stage 0 — Scheduling and windows
+
+* Run: every Tuesday `D`. If Tuesday holiday, next business day; windows shift to preserve Mon-to-Mon semantics.
+* `W_internal = [Monday(D-15), Monday(D-1)]` inclusive ≈ 12 business days ≈ 2 weeks. Rationale: capture build-up while limiting seasonality.
+* `W_news = [Monday(D-7), Monday(D-1)]` ≈ 6 business days ≈ 1 week. Rationale: events most likely to explain recent exposure; older events already investigated.
+* **Issue to resolve (§9):** anticipation pattern expects exposure *before* event. With overlapping windows, need sub-ordering: `exposure build [D-15,D-8] → event [D-7,D-1]`. POC must record `t_build` and `t_event` separately, not just windowOverlap.
+
+#### Stage 1 — Universe
+
+* Include: equities with (a) IMAD delta file coverage, (b) market price history ≥60bd for estimation, (c) mapping ISIN↔ticker↔issuer name.
+* Exclude: delisted, suspended, corporate-action-only jumps (splits/dividends) — flag via adjustment factor.
+
+#### Stage 2 — Data-preprocessing / internal anomaly
+
+* **Baseline option (slide-allowed):** reuse Step 2 formula exactly on `W_internal` vs prior 30bd. Pros: comparable to prod, auditable. Cons: brittle (§4).
+* **Recommended challenger (run in parallel, compare):** robust score:
+  ```
+  z = (AvgLook - medianHist) / (1.4826*MADHist + eps)
+  rel = abs(AvgLook-AvgHist)/(abs(AvgHist)+floor)  # floor e.g. 10k to avoid /0
+  peer_z = (z[d,s] - median_d'(z[d',s])) / MAD_d'
+  flag if (|z|>3 OR rel>30%) AND maxAbs>10k AND peer rank top 5%
+  ```
+  Plus direction check: sign(AvgLook-AvgHist) vs sign(subsequent abnormal return) consistency.
+* Output `S1`: `{ISIN, ticker, desks flagged, scores, AvgLook, AvgHist, maxAbs, volumes, price stats}`. Cap S1 e.g. top 50 to bound LLM cost; log full ranking.
+
+#### Stage 3 — LLM news lookup and confirmation
+
+For each `s in S1`:
+
+1. **Entity linking:** expand to `{issuer legal name, aliases, ISIN, tickers per venue, subsidiary names}`. E.g. `Micron Technology Inc / MU / US5951121038`. Needed for Stellantis (multi-listing) and Sandisk (post-spin from Western Digital — alias handling critical).
+2. **Retrieval:** query trusted corpus only: RNS/Regulatory News Service, EQS/DGAP, GlobeNewswire/Business Wire/PR Newswire, company IR press, AMF/SEC filings, reputable press (Reuters, Bloomberg, Les Echos). No forums/social as primary. Filter `pubDate in W_news`, language EN+FR, dedup by simhash.
+3. **Pre-filter:** FinBERT / FinDeBERTa / FANAL 12-18 classes to keep only plausibly price-moving categories: M&A, Earnings/Profit-Loss, Guidance, Financing, Rating, Legal, Product, Restructuring. Drop CSR/brand noise.
+4. **LLM price-sensitivity classification (LSEG-style, App.C):** two-step prompt: Step1 `sensitive-or-other`, Step2 `not-sensitive-or-other`, 9-point scale 1-3 NOT / 4-6 HARD / 7-9 SENSITIVE, with concise summary + chain-of-thought + quote. Input: article clean text + issuer + dates + market context (index return that day). Output JSON.
+5. **Aggregation:** stock-level `eventConfirmed = any article >=7 OR ≥2 articles >=6 from independent sources`. Record `t_event = earliest sensitive article date`, `eventType`, `sources`.
+6. **Output `S2`:** subset of S1 with ≥1 confirmed event.
+
+Controls: retrieval timestamp, query strings, model ID + version + temperature 0, max tokens, refusal handling, PII redaction.
+
+#### Stage 4 — Alert composer (Excel, 1 file per confirmed stock)
+
+Sheets (see App.B mock):
+
+1. `Cover`: ISIN/ticker, run ID D, windows, desks flagged, scores, event date/type, LLM sensitivity, analyst action box.
+2. `Internal_Data`: daily delta per desk (table + chart), AvgLook/AvgHist/rel/maxAbs, volumes Max/Avg/notional, STOR-relevant order details if available.
+3. `Market_Data`: OHLC, returns vs CAC40/Sector, abnormal return/volume/volatility stats, High-Low ratio, 8% flag.
+4. `News_Evidence`: one row per article: date, source, title, URL, sensitivity 1-9, verbatim quote, LLM summary, relevance to position direction.
+5. `Analysis`: LLM holistic paragraph: timeline (build → event), direction consistency (long before positive news?), alternative explanations (macro/sector), confidence + what would overturn, suggested next steps (check comms, orders, STOR?).
+6. `Audit`: data file hashes, retrieval queries, prompt hash, model version, cutoff, analyst labels.
+
+#### Stage 5 — Review and feedback
+
+Analyst labels each alert: `True lead / Benign explained / Unclear`. Labels + features feed weekly precision review and future supervised training. Override rate monitored as human-oversight evidence (EU AI Act Art.14).
+
+### 5.5 Back-test cases frozen
+
+* SANDISK Corp on 25/06/2026
+* MICRON Technology on 02/06/2026
+* Stellantis 06/02/2026
+
+For each, reconstruct `D` as first Tuesday after event + 7d (to respect W_news covering event). Run pipeline with historical internal files + historical news snapshot (not live web with future knowledge). Expect: shortlisted in S1 + confirmed in S2 + plausible narrative. Document failures.
+
+> **Leakage warning:** these dates are after many LLM knowledge cutoffs in 2024-2025 but before 30/09/2026 slide date. Must use retrieval with `as-of` cutoff and record model cutoff; do not rely on parametric memory. Test with model whose cutoff < event vs RAG-only ablation.
+
+---
+
+## 6. Data Specification
+
+### 6.1 Internal delta-risk
+
+* **IMAD source:** `\\smb15-nas1.par.emea.cib\IM4_PRD\Live\Internal\IMAD_EQUITY_RISK_DELTA`
+* **MAM reports:** `\\smb15-nas1.par.emea.cib\TSUR_AT\MAM Risk Files`
+* To document per file: frequency (daily EOD?), granularity (desk/banking book/trader?), measure definition (delta in EUR per 1% underlying move? signed?), currency, missing-day handling, corporate-action adjustments, late corrections, access rights.
+* Minimal schema (proposed, to confirm with CPL):
+  `date | desk_id (CDR) | book | ISIN | ticker | underlying_ccy | delta_eur_per_1pct (signed) | spot_price | source_file | load_ts`
+* Quality checks: staleness, duplicate (desk,ISIN,date), outlier (|delta|>X), zero-fill vs missing distinction, desk mapping stability.
+* Retention: need ≥70bd history for 30bd estimation + 10bd lookback + 20bd post-event for evaluation.
+
+### 6.2 Market data (CPL: trades, orders, risk, market prices)
+
+* OHLCV per ISIN/venue, adjusted + unadjusted, corporate-action calendar, index (CAC40, STOXX600, sector) for market adjustment, FX for EUR notional.
+* Order-level if available for STOR annex: order ID, side, limit, venue, timestamps (placement/cancel/amend), trader/desk, client flag.
+
+### 6.3 News / public information
+
+* Preferred: LSE RNS, Euronext Regulatory News, EQS, AMF filings, SEC EDGAR (for US names Sandisk/Micron), company IR.
+* Secondary: Reuters, Bloomberg News, FT, Les Echos for confirmation; PR Newswire/Business Wire for press releases (note: FANAL trained on these).
+* Metadata required: publisher, URL, pub timestamp (UTC+venue TZ), language, author, title/body clean text, tickers mentioned, event type.
+* Licensing: redistribution into Excel internal only; no public re-publication.
+
+### 6.4 Reference data
+
+* Issuer master: ISIN↔tickers↔legal names↔aliases/subsidiaries, sector, index membership, listing venues, corporate events (spin-offs: Sandisk from WDC 2025 — critical for alias).
+* Calendar: Euronext/NYSE holidays, business-day convention.
+
+### 6.5 Confidentiality
+
+* Internal data stays in bank network; anonymize desk IDs if LLM hosted externally; no client personal data in prompts. If using Bedrock/OpenAI API, require VPC + no-training + DPA; prefer on-prem 14B-class model (Nordgren finding) for POC.
+
+---
+
+## 7. Design Methodology
+
+### 7.1 Improving Step 1: from raw triggers to event studies + LLM
+
+**Market-model abnormality (to add alongside 4x/8%):**
+
+```
+R_it = alpha_i + beta_i * R_mt + eps   # estimation L=120-250bd ending 20bd before T
+AR_it = R_it - (ahat + bhat*R_mt)
+CAR = sum AR over [-1,+1] or [-5,+1]
+SCAR test (Boehmer et al.), Corrado rank test for non-normality
+AbVol = log(V+1) - mean_logV_est  (Campbell-Wasley, Karafiath)
+AbVolatility = R^2 / sigma_est^2 - 1
+Flag if |SCAR|>2 OR AbVol t>2 OR AbVolatility> threshold, with peer/market adjustment
+```
+
+Use sector index as `R_m` per Baker et al. finding that peer index matters more than estimator choice; use Gelbach SQ test robust to non-normality for single-firm studies.
+
+Combine with LLM sensitivity: `price jump unexplained by market + LLM sensitive news = high-confidence event; price jump with no news = suspicious (possible leakage) or macro; no jump but exposure jump + imminent news = anticipatory candidate`.
+
+### 7.2 Improving Step 2: robust anomaly options
+
+* **Option A (baseline):** exact Step 2 reuse. Auditable, comparable.
+* **Option B (robust stats):** median/MAD z + floor + peer rank (spec §5.4). Handles zero-delta, heteroskedasticity, desk heterogeneity. Recommended for POC challenger.
+* **Option C (reconstruction, literature-backed):** PCA / Autoencoder on desk-stock time-series panel (Mazzarisi et al. 2024). Train on normal periods, flag large reconstruction error in investigation window + net directional position at event. Captures shape (ramp-up) not just mean shift. Needs investor-resolved history; feasible with IMAD panel.
+* **Option D (supervised later):** RF/XGBoost with 25-110 features (Deng) once labels accumulate from analyst feedback + enforcement cases. Not for POC v1.
+
+Direction consistency check (often omitted): informed long before positive CAR, short/profit-taking after. Require `sign(AvgLook-AvgHist) == sign(CAR_post)` for `buy-ahead-positive` typology; opposite for negative-news short.
+
+### 7.3 LLM pipeline design (grounded)
+
+* **Two-model pattern:** small classifier (FinBERT/FinDeBERTa/FANAL-ORBERT) for recall + large generative (Claude Sonnet 3.5 / Mistral / Llama-3.1 class) for precision + explanation. FANAL paper shows small fine-tuned beats GPT-4o zero-shot on most event classes at lower cost; GPT-4o needs few-shot to compete.
+* **Two-step LSEG prompt:** Step1 sensitive-vs-other, Step2 not-sensitive-vs-other, to maximize precision on NOT and recall on SENSITIVE. 9-point scale, chain-of-thought, JSON output with `summary, classification, justification, quotes`.
+* **RAG, not memory:** embeddings (e.g. bge-m3) over trusted corpus in vector DB; query by issuer aliases + date filter; retrieve top-k; LLM only sees retrieved texts. Mitigates hallucination, enables citations, allows `as-of` back-test.
+* **Entity + time grounding:** NER + ISIN linking before retrieval; pubDate normalized; discard articles published after D-1 for POC run; record retrieval time.
+* **Scoring, not binary (Nordgren):** 1-10 alert score enables ranking by severity, learning-to-rank for imbalanced data (Frery et al.), and analyst triage by threshold. Calibrate threshold to target precision (e.g. review top 20/week).
+* **Self-consistency:** sample n=3 reasoning paths, average score; reduces variance (Nordgren).
+
+### 7.4 Fusion logic
+
+```
+S1_score (exposure anomaly 0-10) + market_abnormality (0-10) + news_sensitivity (1-9 → 0-10)
+→ final_rank = w1*S1 + w2*market + w3*news  (weights tuned on back-tests, e.g. 0.4/0.2/0.4)
++ rule overlays: if news_sensitive AND direction_consistent → boost; if macro_day → demote
+```
+
+Keep rules auditable; log weights/version.
+
+---
+
+## 8. Literature Review
+
+### 8.1 Surveys and framing
+
+* **Tiwari et al. IEEE Access 2021 — ML in Financial Market Surveillance:** defines two abuse families (price manipulation: spoofing, wash, ramping; insider trading via classified info), notes scarcity of labels, imbalance, sequential nature, need for contextual/collective anomaly. Compares supervised (k-NN, trees, ANN, SVM) when labels exist vs unsupervised (LOF, COF, k-NN global) + active anomaly detection for triage. Finds regression-tree ensembles robust for price prediction → abnormal price detection. Directly justifies your ensemble + human-in-loop.
+* **Maheshwari & Chatnani 2023 — SupTech SLR 55 papers 1999-2022:** SupTech detects manipulation/insider/fraud and forecasts crises; empowers supervisors. Calls for shared datasets.
+* **Khodabandehlou & Golpayegani 2022; Yi et al. 2023:** manipulation/fraud detection systematics; RNN-ensemble, RF excel on volumes/returns/volatility features.
+* **Annunziata 2026 — Market Abuse and AI (RegTech/SupTech):** EU MAR analysis. Four surveillance families: (i) rule-based (your RB), (ii) pattern recognition ML, (iii) network analysis, (iv) text mining NLP. Supervised + unsupervised complementary. Reviews AMF ICY, BaFin ALMA, SEC MIDAS, CSA MAP, ASIC MAI, NASDAQ SMARTS/NICE/Scila. Concludes MAR needs interpretation + supervisory practice update, not wholesale rewrite, but AI raises accountability/transparency/cybersecurity issues. Your POC is textbook (i)+(iv) hybrid.
+* **Priyadarshi & Kumar JCSS 2024 — Insider detection with AI review:** ML/DL promising but data heterogeneity + cross-country regulatory variance persist; need standardized datasets + collaboration.
+
+### 8.2 Econometrics: event studies, volume/volatility, Consob MAD
+
+* **Brown & Warner 1985; Boehmer et al. 1991; Corrado 1989; Kolari-Pynnonen 2011:** market-model CAR, standardized cross-sectional test, rank tests for thin trading/asymmetry/variance increases. FTSE-350 study (PMC 2022) shows methodology matters: 240d estimation, FTSE-350 index proxy, both BMP parametric + Corrado non-parametric; finds much smaller insider abnormal returns (sales -0.75% post) once large-cap controlled — warns against overstating profitability.
+* **Volume event studies:** Cready-Ramanan log-volume power, Campbell-Wasley mean/market-model abnormal log-turnover, Karafiath GLS vs OLS (OLS sufficient, heteroskedasticity-robust stats essential), Yadav review, EventStudyTools/ R EventStudy package (`VolumeModel`, `VolatilityModel`). Corporate events often show volume/volatility spikes without net price move — exactly why Step 1 price-only misses cases.
+* **Baker-Gelbach 2020 (ML for single-firm event studies in litigation):** regularization helps variance/power modestly; bigger wins from peer index + SQ robust test. Prescription for your market adjustment.
+* **Minenna/Consob QDF54 — Detection of Market Abuse quantitative approach:** tripwires from theory + supervisory experience + observed cases: autocorrelated volumes per participant, diffusion-process abnormal returns (alternative to market model), joint interpretation into warnings with temporal validity. Validated on Consob insider/manipulation cases. Your Steps 1-3 are a simplified Consob tripwire set; read QDF54 for calibration method.
+* **Mitchell-Netter (SEC disgorgement):** market-model abnormal return × position = illicit profit proxy for sanctions. Useful for materiality threshold (€1M notional) justification.
+* **Stylized facts:** Meulbroek 1992 (higher volumes + abnormal returns on insider days, herd effect), Cornell-Sirri 1992 (insiders hide in small trades), Bhattacharya et al. 2000 Mexico (pre-announcement leakage fully anticipates, no disclosure effect), Chakravarty 1999 Carnation (disclosure effect exists but insider vs uninformed price impact inseparable), Bagliano et al. Italy (no autocorrelation change). Implication: look for small but persistent directional build + volume from followers, not just block trades.
+
+### 8.3 Supervised ML for insider/unlawful trading
+
+* **Deng et al. 2019/2021 (DCZ) — Intelligent system China:** PCA + RF on 26 indicators, recall 83.87% 60d window.
+* **2025 RF extension to US (Comp. Economics):** 9.6M Form-4 + CRSP + Compustat, 110 features (20 numeric à la DCZ + governance: IsDirector/Officer/10%Owner, Acquisition/Disposition), 3984 balanced transactions, RF 95%+ accuracy, permutation + hierarchical Spearman clustering for importance. Key predictors: governance, performance, market risk. Caveats: balanced lab sample overstates production precision; feature engineering + data quality dominate. Lesson: once you have labels, governance + risk features help; start logging them now.
+* **Golmohammadi et al. DSAA 2014; Wang et al. Neurocomputing 2019:** NN/SVM/trees/RNN-ensemble for manipulation (pump-dump, spoofing) on returns/volumes/volatility, daily + tick. Relevant if you expand beyond TAME to manipulation typologies later.
+
+### 8.4 Unsupervised anomaly + networks (core for internal data)
+
+* **Mazzarisi et al. EPJ Data Science 2024 — Consob/Italian takeovers 2019-2021 investor-resolved:** two complementary unsupervised methods around PSEs: (1) k-means clustering discontinuity vs own past + vs peers; (2) statistically-validated co-occurrence networks for synchronized groups (insider rings: directional trading before PSE). Human-in-loop: seed from (1) → check clique in (2). Built to mimic Consob investigator reasoning + court-tested cases. **Closest methodological precedent to your Step 2 upgrade + ring extension.**
+* **Mazzarisi et al. 2024 arXiv:2403.00707 — PCA/Autoencoders contextual anomaly:** reconstruction paradigm on full position time-series per investor per PSE; flag if max error day in investigation window + infrequent activity or crowdedness condition + net buying at PSE (position_T - position_0 >0.5). Data-driven thresholds (bimodal score → local minimum, top decile for crowdedness). Overcomes arbitrary 3-feature summaries. Directly implementable on IMAD panel.
+* **General anomaly:** Isolation Forest (FCA TechSprint winner for false-positive reduction), LOF/COF/LoOP for local vs global, LSTM/TCN autoencoders for sequences, Bayesian nets for sparse anomalies (FCA DHI), econophysics kinetic-energy order-book models (KCL/UCL), entropy-based layering detector (SteelEye). FCA TechSprint 2024 solutions catalogue is a playbook: parameter-free auto-calibration, eyeDES contextual alerts + feedback retraining loop, eflow flexible parameterization, Conatix time-series classification with explainability, Kaizen multimodal.
+* **Change-point:** PELT, BOCPD, CUSUM for mean/variance shifts in delta/volume; GARCH(1,1) for volatility regime (EventStudy Dieselgate vignette uses GARCH for AR/volume/volatility).
+
+### 8.5 NLP / LLM for finance and surveillance (core for event confirmation)
+
+* **Financial language models:** FinBERT (Araci/Prosus), FLANG, PIXIU, InvestLM, **BloombergGPT 50B** (FinPile + Pile, best on ConvFinQA/FiQA/FPB/Headline, NER second). Finding: fine-tuned encoder (BERT/RoBERTa/DeBERTa) beats zero-shot GPT-3.5/4 on narrow finance classification; GPT-4 wins on broad/diverse news with good prompting (EMNLP-FinLMEval, MDPI 2025 GPT vs FinBERT +10% with prompt engineering, 2024 compact-vs-GPT study with market-reaction labels). **Implication:** use FinBERT-class for cheap high-recall pre-filter, GPT/Claude-class with few-shot for nuanced price-sensitivity + explanation.
+* **FANAL 2024 (BERT + ORPO):** 12 financial categories (M&A, Bankruptcy, Dividend, Debt Default, Public/Private finance, etc.), silver labels via XGBoost + 1200 manual, ORBERT calibration for imbalance. Beats GPT-4o/Llama-3.1/Phi-3 few-shot on most classes, cheaper. FinDeBERTa HF extends to 18 labels with per-label P/R (Dividend 1.0, M&A 0.89). Use taxonomy for `eventType` field.
+* **Event causality:** FinCausal 2022, DEMAMD; LLM-augmented LLaMA + graph reasoning +5-10 F1 on multi-cause, handles implicit/multi-hop causality (rate hike → market dip → FX). Relevant for protracted processes and ripple attribution.
+* **FinRipple ACL 2025:** time-varying KG + adapter + RL with asset-pricing theory to predict cross-entity ripple; relaxes single-company event-study assumption. Needed for macro vs idiosyncratic disambiguation and for Stellantis-type supply-chain spillovers.
+* **LSEG Surveillance Guide (AWS Bedrock + Claude Sonnet 3.5, Sep 2025):** production-grade reference. 250k RNS 6 months, EDA, 110 expert-annotated 9-point scale, two-step prompt, summary + classification + CoT justification, 6-week pilot: 100% precision NOT, 100% recall SENSITIVE (never misclassify sensitive as not). Benefits: triage time, consistency, audit trail, scale. Roadmap: add financials/market data, few-shot/fine-tune, live side-by-side validation. **Copy this evaluation + deployment pattern.**
+* **FCA TechSprint SteelEye transcript:** vector DB for trader/instrument relationships (correlation, sector, LLM description similarity) + entropy layering score + LLM verification with explainability out-of-box; two LLMs disagree → use agreement as confidence; fine-tune ambition. Pattern: deterministic anomaly → LLM verifier/explainer.
+* **Nordgren 2025 thesis — LLM alert scoring:** synthetic price-ramping/circular-trading datasets, 7-32B open models vs Gemini 2.5 Flash, zero/few-shot, self-correction/consistency, doc access, graded 1-10 vs binary, AUC + Mann-Whitney. Result: few-shot significantly helps, others not; self-consistency raises AUC via variance reduction; graded > binary for ranking; ~14B best open size. **Adopt: few-shot + 1-10 + self-consistency.**
+* **ACM 2025 ethical judgment benchmark (73 FMSB enforcement →1971 Taguchi variants, 10 LLMs):** larger models more cautious but still incentive-sensitive (profit framing, obfuscation raise approval of suspicious trades). Warning: don't let LLM approve trades; constrain to evidence summarization with oversight.
+
+### 8.6 Explainability, trust, human-in-loop
+
+* **Frontiers 2022 (FIRM Round Table) + FIN-TECH:** SHAP clustering (Bussmann et al.), plausibility checks for critical decisions, stakeholder-specific explanations (analyst vs supervisor vs client). Model-agnostic post-hoc + intrinsic transparency.
+* Active anomaly detection + learning-to-rank (AP-based) for imbalanced alert lists with equal-weight false-positive problem.
+
+### 8.7 SupTech in production (what peers run)
+
+* Core engines still NASDAQ SMARTS, NICE Actimize, Scila, Trading Technologies — indicator-based, need adaptive ML overlay for volumes/data growth.
+* Supervisors: MIDAS (SEC, order-book analytics), MAI (ASIC, real-time algorithmic, reduced search time), MAP (CSA), ICY (AMF), ALMA (BaFin). Trend: anomaly detection + surveillance models + text mining combined.
+
+---
+
+## 9. Assessment: Is the Proposed Approach Interesting?
+
+### 9.1 Strengths (why to proceed)
+
+1. **Fills the acknowledged void:** no event data → LLM-derived event feed is cheapest viable source vs licensing RavenPack/Bloomberg Event.
+2. **Correct LLM leverage:** classification/summarization/ranking, not adjudication. Matches LSEG/FCA validated pattern; limits model-risk surface.
+3. **Exposure-first reduces search:** scanning 2-week delta panel (hundreds of stocks × desks) is tractable; news lookup only on shortlist controls cost/latency.
+4. **Analyst-ready output:** Excel with data + narrative directly supports triage and STOR drafting; provides audit trail if versioned.
+5. **Incremental:** reuses Step 2, weekly cadence fits post-trade surveillance resourcing, back-tests concrete.
+6. **Extensible:** same pipeline generalizes to other MAR typologies (rumor, front-running client orders Art.7(d)) by swapping event taxonomy.
+
+### 9.2 Weaknesses and required fixes
+
+| # | Issue | Severity | Fix for v1.1 |
+|---|-------|----------|--------------|
+| 1 | Temporal ambiguity: overlap W_internal/W_news conflates reaction with anticipation | High | Record t_build vs t_event; require build precedes event; report lead-lag days; add post-event unwind check |
+| 2 | Fixed thresholds (4x,8%,30%,4x,€1M/€10k) uncalibrated, division-by-zero, regime-sensitive | High | Add market-adjusted abnormality + robust z/peer rank challenger; floor for division; per-desk calibration |
+| 3 | Macro filter missing → sector/macro jumps flagged as idiosyncratic | Med | Index/sector adjustment + FinRipple-style KG check; demote if >X% peers jump same day |
+| 4 | LLM hallucination, source bias, alias failure (Sandisk/WDC spin) | High | Trusted-corpus RAG + entity linking + citations + FinBERT pre-filter + two-step 9-point prompt |
+| 5 | Leakage (2026 events possibly in parametric memory) | High | Enforce retrieval cutoff, record model cutoff, RAG-only ablation, back-test with pre-event model |
+| 6 | Evaluation n=3, no negatives, no metrics | High | Expand to enforcement + benign volatile cases; report precision@k, recall, analyst time; graded scoring |
+| 7 | Direction consistency ignored (long vs short vs news sign) | Med | Require sign agreement; classify buy-ahead-positive vs sell-ahead-negative typologies |
+| 8 | Confidentiality + audit unspecified | High | VPC/on-prem, prompt/version logging, file hashes, override tracking |
+| 9 | Weekly latency vs STOR without delay | Low-Med | Position as complement to daily RB + real-time controls; define SLA for escalation |
+|10 | Excel scale + lineage | Low | Versioned template + machine-readable parquet alongside Excel for metrics |
+
+### 9.3 Comparison to SOTA
+
+* Vs pure price RB: strictly more informative (adds event grounding + narrative). Should reduce analyst triage time (LSEG reported) even if raw precision gain modest.
+* Vs full ML (Deng RF, Consob k-means/SVN, AE reconstruction): less data-hungry, faster to POC; but less powerful for ring detection and subtle build-ups. Plan AE/SVN as phase 2.
+* Vs LSEG Guide: equivalent LLM core, but LSEG starts from price alerts → news triage, you start from exposure → news confirmation. Both valid; ideally run both directions and intersect (high-precision) + union (high-recall) views. Recommend implementing bidirectional check in v1.1: `S_exposure ∩ S_priceEvent` as priority queue.
+
+**Overall:** interesting and fundable as POC; not yet defensible as standalone surveillance control. Proceed with hardened design below.
+
+---
+
+## 10. Risks, Model Risk, EU AI Act, Governance
+
+### 10.1 Model-risk framing (SR 11-7 / EBA / ECB)
+
+Under SR 11-7 (Fed/OCC 2011, confirmed 2024 to cover AI/ML/LLM apps) and EU equivalents (EBA GL 2021/05 internal governance, ECB Guide to Internal Models 2024, EBA ML-for-IRB 2021/2023, BCBS 239), any quantitative surveillance model is a **model**: needs inventory tiering, conceptual soundness doc, independent validation (separate from developers), outcomes analysis on held-out/production, implementation controls, ongoing monitoring with revalidation triggers, board reporting. Vendor LLM is not exempt — bank remains responsible, must do own outcomes analysis + challenger.
+
+For surveillance (non-capital) tiering is typically medium, but STOR failure = regulatory breach → elevate to high attention.
+
+### 10.2 EU AI Act (Reg. 2024/1689, in force Aug 2024)
+
+* **Classification:** creditworthiness scoring of natural persons = high-risk Annex III 5(b) (obligations from 02/12/2027 per Omnibus 2026/1744). **Fraud detection expressly carved out** from 5(b). TAME surveillance is fraud/abuse detection, not credit scoring, and scores issuers/desks, not natural persons' creditworthiness → **not high-risk under 5(b)** on current reading. No automatic high-risk tag.
+* **Caution:** Commission high-risk guidelines due 02/02/2026; profiling of natural persons (trader-level suspicion scoring) could raise fundamental-rights scrutiny. Treat as **limited-risk + internal high-stakes**: voluntarily apply high-risk disciplines proportionally — risk management Art.9, data governance/bias Art.10, logging Art.12, transparency Art.13, human oversight Art.14, accuracy/robustness/cybersecurity Art.15, QMS Art.17 — via existing MRM file (EBA mapping 2025 finds no contradiction, recommends integrated file, not parallel).
+* **Deployer duties:** follow provider instructions, ensure competent oversight with real override (monitor override rate for automation bias), keep logs, FRIA-style impact note if trader-level profiling. Art.86 explanation right applies to credit decisions, not directly here, but analyst-facing explanations still required for audit.
+
+### 10.3 DORA, GDPR, MAR confidentiality
+
+* DORA ICT risk, logging, incident reporting for pipeline + LLM endpoint.
+* GDPR: minimize personal data in prompts; trade-desk pseudonymization; STOR personal data handled under MAR legal basis, not in LLM training.
+* No training on internal data by external provider; contract + technical (no-log, VPC) guarantees.
+
+### 10.4 LLM-specific risks and mitigations
+
+* Hallucinated events/citations → RAG with URL + timestamp + quote; NLI entailment check (summary must be entailed by retrieved text); refuse if no source.
+* Source capture bias (English only, missing Euronext filings) → bilingual queries, include regulatory feeds.
+* Prompt injection via news (malicious press release instructing LLM) → system/user separation, no tool auto-execution from retrieved text, output JSON schema validation.
+* Data poisoning/adversarial (Art.15) → allowlist publishers, checksum feeds, monitor sensitivity distribution drift.
+* Over-reliance → graded score + mandatory analyst checkbox + override log; track precision/recall by analyst.
+
+### 10.5 Validation and audit artefacts (to produce)
+
+Model doc (concept, data, methodology, limitations, use), validation report (independent), back-test report, prompt/model registry, retrieval logs, Excel versioning, monitoring dashboard (alert counts, precision, latency, LLM refusal/disagreement rate), change log, incident runbook.
+
+---
+
+## 11. Evaluation and Back-Test Protocol
+
+### 11.1 Objectives
+
+Prove (a) shortlist captures real cases, (b) LLM confirmation adds precision vs price-only, (c) narrative saves analyst time, without leakage.
+
+### 11.2 Datasets
+
+* **Positives:** 3 frozen cases + expand to 10-20 AMF/SEC enforcement TAME/insider cases on equities with known event dates (collect from AMF sanctions, SEC litigation releases — Rutgers deep-learning study uses litigation releases + market + social data).
+* **Negatives:** (i) top exposure-break stocks with no price-moving news in window (benign rebalancing), (ii) large price jumps with no exposure break (macro/sector), (iii) random stocks. Needed to estimate false-positive rate.
+* **As-of reconstruction:** internal files as stored at D (no restatement), market data vintage, news snapshot with `pubDate <= D-1` (Common Crawl / GDELT / licensed archive, not live search).
+
+### 11.3 Metrics
+
+* Stage 2: recall@50 (positives in S1), mean rank, false-shortlist rate.
+* Stage 3: precision/recall of event confirmation vs expert labels (LSEG 9-point protocol, 2 annotators + adjudication), citation faithfulness (% claims with valid quote/URL).
+* End-to-end: precision@k (k=10,20), recall, F1, analyst time per alert (A/B vs manual), override/agreement rate, STOR conversion rate (long-term).
+* Robustness: ablation without LLM (price+exposure only), without exposure (price+news à la LSEG), small vs large LLM, zero vs few-shot, with/without market adjustment.
+* Statistics: Mann-Whitney for configuration gains, AUC for graded scores (Nordgren), Boehmer/Corrado for market abnormality significance.
+
+### 11.4 Leakage controls
+
+* Record LLM knowledge cutoff; run RAG-only (no parametric) vs parametric-only ablation; test with model cutoff < event date; forbid web browsing beyond dated snapshot in back-test; document retrieval timestamps.
+
+### 11.5 Analyst study
+
+* 2-3 IMAD analysts label 110-article sample (LSEG replication) + 30 alerts. Measure inter-rater kappa, time saved, usefulness 1-5, trust. Few-shot examples drawn from this set.
+
+### 11.6 Acceptance for POC success (proposal)
+
+* ≥2/3 frozen cases in S1 and S2 with correct event date ±1bd and direction-consistent narrative.
+* Precision@20 ≥ price-only baseline +15pp or triage time -30% with no recall loss.
+* Zero hallucinations with fake URL in sample (100% citation validity).
+* Documented limitations + v1.1 plan. No production deployment gate yet.
+
+---
+
+## 12. Implementation Plan and Technical Options
+
+### 12.1 Phases (8-10 weeks POC)
+
+* W1-2: Data inventory + as-of snapshots for 3 cases + universe + reference master + price history; freeze parameter table; set up audit repo.
+* W3-4: Stage 2 baseline (exact Step 2) + challenger (robust z/peer) + market-adjusted stats; evaluate recall@50.
+* W5-6: News corpus + entity linking + FinBERT/FANAL pre-filter + RAG + two-step prompt + Excel composer; annotate 110-article calibration set.
+* W7: End-to-end back-tests + ablations + leakage checks.
+* W8: Analyst study + metrics + validation draft + governance file + go/no-go for pilot (side-by-side with RB, no auto-escalation).
+
+### 12.2 Tech stack options
+
+* **Orchestration:** Python + Airflow/Dagster weekly DAG (Tue), parquet + SQLite/Postgres for features, MLflow for runs.
+* **Market/anomaly:** pandas/polars, statsmodels (market model, BMP/Corrado), scikit-learn (IF, PCA), PyTorch AE optional, ruptures (PELT).
+* **News:** licensed feeds + EDGAR/EQS APIs + GDELT snapshot; Elasticsearch/OpenSearch + vector extension (pgvector/Qdrant) with bge-m3 embeddings; deduplication simhash.
+* **LLM:** Prefer VPC/on-prem: Mistral/Llama-3.1-14B class (Nordgren sweet spot) or Bedrock Claude Sonnet 3.5 via private endpoint with no-training. Temperature 0, JSON mode. Prompt registry + Langfuse-style tracing.
+* **Output:** openpyxl templated Excel + parquet twin + PDF snapshot for immutability; share to IMAD folder with ACLs.
+* **Monitoring:** Grafana: alert counts, score distributions, retrieval coverage, LLM latency/refusal, analyst labels, drift.
+
+### 12.3 Roles
+
+IMAD (owner, labels, STOR logic), CPL/MAM (data), Quant/AI (pipeline, validation independent reviewer separate), Legal/Compliance (MAR, confidentiality), IT/Security (VPC, DORA logs), Model Risk (tiering, validation).
+
+---
+
+## 13. Functional and Non-Functional Requirements
+
+**Functional:** FR1 weekly run with Mon-Mon windows; FR2 shortlist with scores/features; FR3 news evidence with citations; FR4 price-sensitivity 1-9 + event type; FR5 1 Excel/stock with 6 sheets; FR6 audit sheet with hashes/versions; FR7 analyst label capture; FR8 back-test reproducibility with as-of flag; FR9 alias-aware entity linking; FR10 bilingual EN/FR.
+
+**Non-functional:** NFR1 no internal data exfiltration; NFR2 reproducibility (seed, version pin); NFR3 latency <12h for full universe; NFR4 availability for Tue review; NFR5 explainability (every score has drivers + quotes); NFR6 bias/fairness (no trader personal attributes as features); NFR7 logging per AI Act Art.12/DORA; NFR8 human override mandatory; NFR9 cost cap per run (limit S1 size, cache embeddings); NFR10 composability (run baseline vs challenger side-by-side).
+
+---
+
+## 14. Open Questions and Decision Log
+
+| ID | Question | Owner | Due | Status |
+|----|----------|-------|-----|--------|
+| OQ1 | Exact delta definition (EUR/1%? DV01? signed?) + desk hierarchy | CPL | W1 | Open |
+| OQ2 | Historical window for Step 2: [T-40,T-11] 30bd confirmed? handling of holidays | IMAD | W1 | Open |
+| OQ3 | Confirm W_internal vs W_news overlap intent vs build-then-event split | IMAD | W1 | Open — recommend split analysis |
+| OQ4 | Licensed news feeds available? RNS/EQS/Bloomberg entitlement for redistribution | Legal/IT | W2 | Open |
+| OQ5 | LLM hosting: on-prem vs Bedrock VPC? approved models list? | Security | W2 | Open |
+| OQ6 | Macro filter spec: 70% of which portfolio? index proxy acceptable? | IMAD | W2 | Open |
+| OQ7 | STOR annex automation in scope for pilot? | Compliance | W3 | Open — propose no |
+| OQ8 | €10k/€1M thresholds: inflation/FX adjustment? per-cap calibration? | IMAD | W3 | Open |
+| OQ9 | Sandisk alias (WDC spin) + Stellantis venues master source? | CPL | W1 | Open |
+| OQ10 | Model inventory tier + validator assignment | Model Risk | W2 | Open |
+
+---
+
+## 15. Glossary
+
+* **TAME:** Trading Ahead of Market Event. **PSE:** Price-Sensitive Event (Consob term, synonymous with Market Event). **MAR/MAD:** Market Abuse Regulation/Directive. **PPAET:** Person Professionally Arranging/Executing Transactions. **STOR:** Suspicious Transaction and Order Report. **CPL:** data provider. **CDR:** trading desk. **IMAD:** surveillance. **MAM:** asset-management risk reports. **CAR/AR:** Cumulative/Abnormal Return. **AbVol:** Abnormal Volume. **RAG:** Retrieval-Augmented Generation. **CoT:** Chain-of-Thought. **IF/LOF/AE:** Isolation Forest / Local Outlier Factor / Autoencoder. **BMP:** Boehmer et al. test. **FANAL/ORBERT/FinBERT:** financial NLP models. **KG:** Knowledge Graph.
+
+---
+
+## 16. References
+
+* EU 596/2014 MAR; 2014/57/EU MAD II; Deleg. 2016/957 STOR template; ESMA MAR Q&A.
+* EU 2024/1689 AI Act; EBA AI Act mapping 2025; Digital Omnibus 2026/1744; EBA GL 2021/05; ECB Guide Internal Models 2024; SR 11-7; OCC AI statements 2021/2023/2024.
+* Brown-Warner 1985; Boehmer et al. 1991; Corrado 1989; Kolari-Pynnonen 2011; Campbell-Wasley 1996; Cready-Ramanan 1991; Karafiath 2009; Yadav 1992; Baker-Gelbach 2020; Mitchell-Netter 1994; Meulbroek 1992; Cornell-Sirri 1992; Bhattacharya et al. 2000; Chakravarty 1999; Bagliano et al. 2001; Minenna Consob QDF54.
+* Tiwari et al. IEEE Access 2021; Maheshwari-Chatnani 2023; Khodabandehlou-Golpayegani 2022; Yi et al. 2023; Priyadarshi-Kumar JCSS 2024; Annunziata 2026 RegTech/SupTech.
+* Deng et al. 2019/2021; 2025 RF 110-feature US extension; Golmohammadi DSAA 2014; Wang et al. 2019 RNN-ensemble.
+* Mazzarisi et al. EPJ DS 2024 k-means + SVN insider rings; 2024 PCA/AE reconstruction arXiv:2403.00707; Consob takeover 2019-2021 dataset.
+* FinBERT Araci 2019; BloombergGPT Wu et al. 2023; FLUE Shah et al. 2022; FinLMEval EMNLP 2023; FANAL arXiv:2412.03527 ORBERT+ORPO; FinDeBERTa HF 18-label; FinRipple ACL 2025; FinCausal 2022/DEMAMD; LLM causality King Saud 2025.
+* LSEG Surveillance Guide AWS Bedrock + Claude Sonnet 3.5 Sep 2025 (250k RNS, 110 annotated, 9-point, 100% prec NOT / 100% rec SENS).
+* FCA Market Abuse TechSprint May-Jul 2024 (IF, Bayesian nets, econophysics, eyeDES/eflow/SteelEye/Conatix/Kaizen/DHI); SteelEye transcript (vector DB + entropy + LLM verifier).
+* Nordgren 2025 Uppsala/KTH LLM alert scoring (few-shot, 1-10 vs binary, self-consistency, 14B sweet spot).
+* ACM 2025 LLM ethical judgment benchmark (73 FMSB →1971 Taguchi, 10 LLMs).
+* Rutgers deep insider DL (litigation + market + social + XAI); FTSE-350 insider anomaly PMC 2022.
+* Frontiers 2022 FIRM explainable trustworthy AI; Bussmann SHAP clustering; Frery learning-to-rank AP for imbalance.
+
+---
+
+### Appendix A: Production Parameter Table (frozen)
+
+| Step | Param | Prod | Meaning | Issue |
+|------|-------|------|---------|-------|
+|1|HighLow mult|4|HighLow[T] >=4*Avg10|regime-sensitive|
+|1|Close move|8%|abs ret >=8%|not market-adj|
+|1|Avg window|10bd|HighLow avg|—|
+|1|Macro|70%|demote if >70% portfolio jumps|not implemented|
+|2|Lookback|10bd|AvgLook|—|
+|2|Historical|30bd|AvgHist|confirm offset|
+|2|Rel break|30%|abs diff/hist|/0 risk|
+|2|Size floor|10000 EUR/1%|max abs|clarify unit|
+|3|Vol mult|4|Max>4*AvgHist|—|
+|3|Notional|1M EUR|Max*Price|—|
+
+### Appendix B: Example Alert File Mock (1 per stock)
+
+`TAME_D2026-07-07_MU_MicronTechnology.xlsx`
+* Cover: MU US5951121038, D=Tue 07/07/2026, W_int 22/06-06/07, W_news 29/06-06/07, desks: EQD-X flagged z=4.2 rel=68% maxAbs €45k, market: +11.2% vs SOX +2.1% SCAR 3.1, event: 02/07 earnings beat + guidance raise, sensitivity 8/9, action: review.
+* Internal_Data: daily delta table/chart per desk.
+* Market_Data: OHLC, AR/CAR, AbVol, HighLow 5.2x, 8% flag true.
+* News_Evidence: 3 rows with date/source/URL/score/quote/summary.
+* Analysis: Timeline 25-30/06 build long +75%, 02/07 pre-market PR, direction consistent, macro SOX +2% does not explain +11%, alternative: sector rotation? Confidence medium-high, overturn if: build is client facilitation, not prop. Next: check order blotter, comms, STOR draft?
+* Audit: hashes, queries, prompt v0.3, claude-sonnet-3.5-20250601 temp0, cutoff 2026-07-06, retrieval 2026-07-07T06:12Z.
+
+### Appendix C: Prompt Templates (LSEG-style, to calibrate on 110)
+
+**System:** You are a market-surveillance assistant. Classify price-sensitivity under MAR reasonable-investor test. Use ONLY provided article text. Cite quotes. Output strict JSON. Temperature 0.
+
+**Step1 user:** Article:{clean_text} Issuer:{names/tickers} PubDate:{d} Market:{index ret d}. Task: Is it potentially price-sensitive or OTHER? Return {summary_2lines, class_SENSITIVE_or_OTHER, score_1_9, justification_CoT_3bullets, quotes_[max2]}. 1-3 NOT, 4-6 HARD, 7-9 SENSITIVE. Examples few-shot: [earnings beat 8, dividend trivia 2, ...].
+
+**Step2 user:** Same article. Task: Is it confidently NOT sensitive or OTHER? Return same schema. Final = combine: if Step1 SENSITIVE(>=7) AND Step2 OTHER → SENSITIVE; if Step1 OTHER AND Step2 NOT → NOT; else HARD → human.
+
+**Alert-analysis user:** Given {internal stats, market stats, confirmed articles JSON}, write timeline, direction consistency, alternative explanations, confidence + overturn conditions, next steps. No legal conclusion of guilt. Cite article IDs.
+
+### Appendix D: Pseudocode
+
+```python
+def weekly_run(D):
+  Wint = mondays(D-15, D-1); Wnews = mondays(D-7, D-1)
+  universe = build_universe(as_of=D-1)
+  S1 = []
+  for s in universe:
+    for d in desks(s):
+      look, hist = get_delta(d,s,Wint, hist30_before_Wint)
+      z, rel, mx = robust_scores(look,hist)
+      peer_rank = rank_vs_desks(z,d,s)
+      mkt = market_stats(s, Wint)  # AR/CAR/AbVol
+      if trigger(z,rel,mx,peer_rank): S1.append(...)
+  S1 = topK(S1, 50)
+  S2 = []
+  for s in S1:
+    arts = retrieve_trusted(s.aliases, Wnews)  # date-filtered, deduped
+    pre = finbert_filter(arts)  # keep event-like
+    scored = [llm_sensitivity(a,s) for a in pre]  # 1-9 + summary + quotes
+    if confirmed(scored): S2.append((s,scored))
+  for s,ev in S2: write_excel(s, internal(s), market(s), ev, audit(...))
+  log_metrics(S1,S2); collect_labels()
+```
+
+### Appendix E: Data Dictionary Template (to complete W1)
+
+`IMAD_EQUITY_RISK_DELTA`: file pattern, grain, timezone, desk_id domain, ISIN coverage %, null semantics, restatement policy, sample rows (5, anonymized), owner contact, refresh SLA, retention.
+
+---
+
+*End of golden source v1.0. Next: fill OQ1-OQ10, freeze calibration set, run W1-2 snapshots. No production change until validation sign-off.*
